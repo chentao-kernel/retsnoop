@@ -5,6 +5,7 @@
 #include <bpf/bpf_tracing.h>
 #include <bpf/bpf_core_read.h>
 #include "retsnoop.h"
+#include "compat.bpf.h"
 
 char LICENSE[] SEC("license") = "Dual BSD/GPL";
 
@@ -16,16 +17,14 @@ char LICENSE[] SEC("license") = "Dual BSD/GPL";
 
 #undef bpf_printk
 #define bpf_printk(fmt, ...)						\
-({									\
-	static char ___fmt[] = fmt " ";					\
-	if (printk_needs_endline)					\
-		APPEND_ENDLINE(___fmt);					\
-	bpf_trace_printk(___fmt, sizeof(___fmt), ##__VA_ARGS__);	\
-})
+	({									\
+	 static char ___fmt[] = fmt " ";					\
+	 if (printk_needs_endline)					\
+	 APPEND_ENDLINE(___fmt);					\
+	 bpf_trace_printk(___fmt, sizeof(___fmt), ##__VA_ARGS__);	\
+	 })
 
 #define log(fmt, ...) bpf_printk(fmt, ##__VA_ARGS__)
-#define vlog(fmt, ...) do { if (verbose) { bpf_printk(fmt, ##__VA_ARGS__); }  } while (0)
-#define dlog(fmt, ...) do { if (extra_verbose) { bpf_printk(fmt, ##__VA_ARGS__); } } while (0)
 
 #define __memcpy(dst, src, sz) bpf_probe_read_kernel(dst, sz, src)
 
@@ -60,8 +59,11 @@ struct session {
 };
 
 struct {
-	__uint(type, BPF_MAP_TYPE_RINGBUF);
-} rb SEC(".maps");
+        __uint(type, BPF_MAP_TYPE_ARRAY);
+        __type(key, __u32);
+        __type(value, struct user_args);
+        __uint(max_entries, 1);
+} ret_args_map SEC(".maps");
 
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
@@ -69,22 +71,12 @@ struct {
 	__type(value, struct session);
 } sessions SEC(".maps");
 
-const volatile bool verbose = false;
-const volatile bool extra_verbose = false;
-const volatile bool emit_call_stack = true;
-const volatile bool emit_func_trace = true;
-const volatile bool emit_success_stacks = false;
-const volatile bool capture_args = true;
-const volatile bool capture_raw_ptrs = true;
-const volatile bool use_lbr = true;
-const volatile bool use_kprobes = true;
-
-const volatile int args_max_total_args_sz = DEFAULT_FNARGS_TOTAL_ARGS_SZ;
-const volatile int args_max_sized_arg_sz = DEFAULT_FNARGS_SIZED_ARG_SZ;
-const volatile int args_max_str_arg_sz = DEFAULT_FNARGS_STR_ARG_SZ;
-const volatile int args_max_any_arg_sz = DEFAULT_FNARGS_SIZED_ARG_SZ > DEFAULT_FNARGS_STR_ARG_SZ
-				       ? DEFAULT_FNARGS_SIZED_ARG_SZ
-				       : DEFAULT_FNARGS_STR_ARG_SZ;
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__type(key, __u32);
+	__type(value, struct func_info_elem);
+	__uint(max_entries, 1); /* could be overriden from user-space */
+} func_infos_map SEC(".maps");
 
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
@@ -93,9 +85,6 @@ struct {
 	__uint(max_entries, 1); /* could be overriden from user-space */
 } tgids_filter SEC(".maps");
 
-const volatile __u32 tgid_allow_cnt = -1;
-const volatile __u32 tgid_deny_cnt = -1;
-
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__type(key, int);
@@ -103,15 +92,11 @@ struct {
 	__uint(max_entries, 1); /* could be overriden from user-space */
 } comms_filter SEC(".maps");
 
-const volatile __u32 comm_allow_cnt = -1;
-const volatile __u32 comm_deny_cnt = -1;
+// const volatile char spaces[512] = {};
 
-const volatile __u64 duration_ns = -1;
+// struct stats stats = {};
 
-const volatile char spaces[512] = {};
-
-struct stats stats = {};
-
+# if 0
 static void stat_dropped_record(struct session *sess)
 {
 	if (sess->dropped_records == 0)
@@ -120,22 +105,33 @@ static void stat_dropped_record(struct session *sess)
 	sess->dropped_records++;
 }
 
-/* provided by mass_attach.bpf.c */
-int copy_lbrs(void *dst, size_t dst_sz);
-
+#endif
 /* dynamically sized from the user space */
-struct func_info func_infos[1] SEC(".data.func_infos");
-const volatile __u32 func_info_mask;
+//struct func_info func_infos[1] SEC(".data.func_infos");
+//const volatile __u32 func_info_mask;
 
 static __always_inline const struct func_info *func_info(u32 id)
 {
-	return &func_infos[id & func_info_mask];
+        struct func_info_elem *elem;
+        u32 zero = 0;
+
+        elem = bpf_map_lookup_elem(&func_infos_map, &zero);
+        if (!elem)
+                return NULL;
+
+	return &elem->func_infos[id & elem->func_info_mask];
 }
 
 #ifdef __TARGET_ARCH_x86
 static u64 get_arg_reg_value(void *ctx, u32 arg_idx)
 {
-	if (use_kprobes) {
+	struct user_args *argsp;
+	u32 zero = 0;
+	argsp = bpf_map_lookup_elem(&ret_args_map, &zero);
+	if (!argsp)
+		return 0;
+
+	if (argsp->use_kprobes) {
 		struct pt_regs *regs = ctx;
 
 		switch (arg_idx) {
@@ -158,8 +154,15 @@ static u64 get_arg_reg_value(void *ctx, u32 arg_idx)
 static __always_inline u64 get_stack_pointer(void *ctx)
 {
 	u64 sp;
+	struct user_args *argsp;
+	u32 zero = 0;
 
-	if (use_kprobes) {
+	argsp = bpf_map_lookup_elem(&ret_args_map, &zero);
+	if (!argsp)
+		return 0;
+
+
+	if (argsp->use_kprobes) {
 		sp = PT_REGS_SP((struct pt_regs *)ctx);
 		barrier_var(sp);
 	} else {
@@ -194,11 +197,17 @@ static void capture_vararg(struct func_args_capture *r, u32 arg_idx, void *data)
 	size_t data_off;
 	void *dst;
 	int err, kind, len;
+	u32 zero = 0;
+	struct user_args *argsp;
 
 	data_off = r->data_len;
 	barrier_var(data_off); /* prevent compiler from re-reading it */
 
-	if (data_off >= args_max_total_args_sz) {
+	argsp = bpf_map_lookup_elem(&ret_args_map, &zero);
+	if (!argsp)
+		return;
+
+	if (data_off >= argsp->args_max_total_args_sz) {
 		r->arg_lens[arg_idx] = -ENOSPC;
 		return;
 	}
@@ -216,7 +225,7 @@ static void capture_vararg(struct func_args_capture *r, u32 arg_idx, void *data)
 		/* in this case we mark that we have a raw pointer value */
 		r->arg_ptrs |= (1 << arg_idx);
 
-		err = bpf_probe_read_kernel_str(dst, args_max_str_arg_sz, data);
+		err = bpf_probe_read_kernel_str(dst, argsp->args_max_str_arg_sz, data);
 		if (err < 0) {
 			r->arg_lens[arg_idx] = err;
 			return;
@@ -234,16 +243,22 @@ static void capture_arg(struct func_args_capture *r, u32 arg_idx, void *data, u3
 	size_t data_off;
 	void *dst;
 	int err, kind;
+	u32 zero = 0;
+	struct user_args *argsp;
 
 	if (data == NULL) {
 		r->arg_lens[arg_idx] = -ENODATA;
 		return;
 	}
 
+	argsp = bpf_map_lookup_elem(&ret_args_map, &zero);
+	if (!argsp)
+		return;
+
 	data_off = r->data_len;
 	barrier_var(data_off); /* prevent compiler from re-reading it */
 
-	if (data_off >= args_max_total_args_sz) {
+	if (data_off >= argsp->args_max_total_args_sz) {
 		r->arg_lens[arg_idx] = -ENOSPC;
 		return;
 	}
@@ -251,7 +266,7 @@ static void capture_arg(struct func_args_capture *r, u32 arg_idx, void *data, u3
 	dst = r->arg_data + data_off;
 
 	kind = (arg_spec & FNARGS_KIND_MASK) >> FNARGS_KIND_SHIFT;
-	if (capture_raw_ptrs && (kind == FNARGS_KIND_PTR || kind == FNARGS_KIND_STR)) {
+	if (argsp->capture_raw_ptrs && (kind == FNARGS_KIND_PTR || kind == FNARGS_KIND_STR)) {
 		*(long *)dst = (long)data;
 		dst += 8;
 		r->arg_ptrs |= (1 << arg_idx);
@@ -259,16 +274,16 @@ static void capture_arg(struct func_args_capture *r, u32 arg_idx, void *data, u3
 	}
 
 	if (kind == FNARGS_KIND_STR) {
-		if (len > args_max_str_arg_sz) /* truncate, if necessary */
-			len = args_max_str_arg_sz;
+		if (len > argsp->args_max_str_arg_sz) /* truncate, if necessary */
+			len = argsp->args_max_str_arg_sz;
 		if (is_kernel_addr(data))
 			err = bpf_probe_read_kernel_str(dst, len, data);
 		else
 			err = bpf_probe_read_user_str(dst, len, data);
 		len = err; /* len is meaningful only if successful */
 	} else {
-		if (len > args_max_sized_arg_sz) /* truncate, if necessary */
-			len = args_max_sized_arg_sz;
+		if (len > argsp->args_max_sized_arg_sz) /* truncate, if necessary */
+			len = argsp->args_max_sized_arg_sz;
 		if (is_kernel_addr(data))
 			err = bpf_probe_read_kernel(dst, len, data);
 		else
@@ -289,14 +304,18 @@ static __noinline void record_args(void *ctx, struct session *sess, u32 func_id,
 	struct func_args_capture *r;
 	const struct func_info *fi;
 	u64 i, rec_sz;
+	u32 zero = 0;
+	struct user_args *argsp;
+
+	argsp = bpf_map_lookup_elem(&ret_args_map, &zero);
+	if (!argsp)
+		return;
 
 	/* we waste *args_max_any_arg_sz* + 12 * 8 (for raw ptrs value) to simplify verification */
-	rec_sz = sizeof(*r) + args_max_total_args_sz + args_max_any_arg_sz + 8 * MAX_FNARGS_ARG_SPEC_CNT;
-	r = bpf_ringbuf_reserve(&rb, rec_sz, 0);
-	if (!r) {
-		stat_dropped_record(sess);
+	rec_sz = sizeof(*r) + argsp->args_max_total_args_sz + argsp->args_max_any_arg_sz + 8 * MAX_FNARGS_ARG_SPEC_CNT;
+	r = (struct func_args_capture *)reserve_buf(rec_sz);
+	if (!r)
 		return;
-	}
 
 	r->type = REC_FUNC_ARGS_CAPTURE;
 	r->pid = sess->pid;
@@ -325,41 +344,41 @@ static __noinline void record_args(void *ctx, struct session *sess, u32 func_id,
 		kind = (spec & FNARGS_KIND_MASK) >> FNARGS_KIND_SHIFT;
 
 		switch (loc) {
-		case FNARGS_REG:
-			reg_idx = (spec & FNARGS_REGIDX_MASK) >> FNARGS_REGIDX_SHIFT;
-			vals[0] = get_arg_reg_value(ctx, reg_idx);
-			if (kind != FNARGS_KIND_RAW) {
-				data_ptr = (void *)vals[0];
-			} else {
-				vals[0] = coerce_size(vals[0], len);
-				data_ptr = vals;
-			}
-			break;
-		case FNARGS_STACK:
-			/* stack offset is specified in 8 byte chunks */
-			off = 8 * ((spec & FNARGS_STACKOFF_MASK) >> FNARGS_STACKOFF_SHIFT);
-			vals[0] = get_stack_pointer(ctx) + off;
-			if (kind != FNARGS_KIND_RAW) {
-				/* the pointer value itself is on the stack */
-				err = bpf_probe_read_kernel(&vals[0], 8, (void *)vals[0]);
-				if (err) {
-					r->arg_lens[i] = err;
-					continue;
+			case FNARGS_REG:
+				reg_idx = (spec & FNARGS_REGIDX_MASK) >> FNARGS_REGIDX_SHIFT;
+				vals[0] = get_arg_reg_value(ctx, reg_idx);
+				if (kind != FNARGS_KIND_RAW) {
+					data_ptr = (void *)vals[0];
+				} else {
+					vals[0] = coerce_size(vals[0], len);
+					data_ptr = vals;
 				}
-			}
-			data_ptr = (void *)vals[0];
-			break;
-		case FNARGS_REG_PAIR:
-			/* there is no special kind besides FNARGS_KIND_RAW for REG_PAIR */
-			reg_idx = (spec & FNARGS_REGIDX_MASK) >> FNARGS_REGIDX_SHIFT;
-			vals[0] = get_arg_reg_value(ctx, reg_idx);
-			vals[1] = get_arg_reg_value(ctx, reg_idx + 1);
-			vals[1] = coerce_size(vals[1], len - 8);
-			data_ptr = (void *)vals;
-			break;
-		default:
-			r->arg_lens[i] = -EDOM;
-			continue;
+				break;
+			case FNARGS_STACK:
+				/* stack offset is specified in 8 byte chunks */
+				off = 8 * ((spec & FNARGS_STACKOFF_MASK) >> FNARGS_STACKOFF_SHIFT);
+				vals[0] = get_stack_pointer(ctx) + off;
+				if (kind != FNARGS_KIND_RAW) {
+					/* the pointer value itself is on the stack */
+					err = bpf_probe_read_kernel(&vals[0], 8, (void *)vals[0]);
+					if (err) {
+						r->arg_lens[i] = err;
+						continue;
+					}
+				}
+				data_ptr = (void *)vals[0];
+				break;
+			case FNARGS_REG_PAIR:
+				/* there is no special kind besides FNARGS_KIND_RAW for REG_PAIR */
+				reg_idx = (spec & FNARGS_REGIDX_MASK) >> FNARGS_REGIDX_SHIFT;
+				vals[0] = get_arg_reg_value(ctx, reg_idx);
+				vals[1] = get_arg_reg_value(ctx, reg_idx + 1);
+				vals[1] = coerce_size(vals[1], len - 8);
+				data_ptr = (void *)vals;
+				break;
+			default:
+				r->arg_lens[i] = -EDOM;
+				continue;
 		}
 
 		if (kind == FNARGS_KIND_VARARG)
@@ -367,43 +386,49 @@ static __noinline void record_args(void *ctx, struct session *sess, u32 func_id,
 		else
 			capture_arg(r, i, data_ptr, len, spec);
 	}
-
-	bpf_ringbuf_submit(r, 0);
+	submit_buf(ctx, r, rec_sz);
 }
 
 static __noinline void save_stitch_stack(void *ctx, struct call_stack *stack)
 {
 	u64 d = stack->depth;
 	u64 len = stack->max_depth - d;
+	u32 zero = 0;
+	struct user_args *argsp;
 
 	if (d >= MAX_FSTACK_DEPTH || len >= MAX_FSTACK_DEPTH) {
 		log("SHOULDN'T HAPPEN DEPTH %ld LEN %ld\n", d, len);
 		return;
 	}
-
-	dlog("CURRENT DEPTH %d..%d", stack->depth + 1, stack->max_depth);
-	dlog("SAVED DEPTH %d..%d", stack->saved_depth, stack->saved_max_depth);
+	argsp = bpf_map_lookup_elem(&ret_args_map, &zero);
+	if (!argsp)
+		return;
+	if (argsp->extra_verbose) {
+		log("CURRENT DEPTH %d..%d", stack->depth + 1, stack->max_depth);
+		log("SAVED DEPTH %d..%d", stack->saved_depth, stack->saved_max_depth);
+	}
 
 	/* we can stitch together stack subsections */
 	if (stack->saved_depth && stack->max_depth + 1 == stack->saved_depth) {
 		__memcpy(stack->saved_ids + d, stack->func_ids + d, len * sizeof(stack->saved_ids[0]));
 		__memcpy(stack->saved_res + d, stack->func_res + d, len * sizeof(stack->saved_res[0]));
 		__memcpy(stack->saved_lat + d, stack->func_lat + d, len * sizeof(stack->saved_lat[0]));
-		if (capture_args)
+		if (argsp->capture_args)
 			__memcpy(stack->saved_seq_ids + d, stack->seq_ids + d, len * sizeof(stack->saved_seq_ids[0]));
 		stack->saved_depth = stack->depth + 1;
-		dlog("STITCHED STACK %d..%d to ..%d\n",
-		     stack->depth + 1, stack->max_depth, stack->saved_max_depth);
+		if (argsp->extra_verbose)
+			log("STITCHED STACK %d..%d to ..%d\n",
+					stack->depth + 1, stack->max_depth, stack->saved_max_depth);
 		return;
 	}
-
-	dlog("RESETTING SAVED ERR STACK %d..%d to %d..\n",
-	     stack->saved_depth, stack->saved_max_depth, stack->depth + 1);
+	if (argsp->extra_verbose)
+		log("RESETTING SAVED ERR STACK %d..%d to %d..\n",
+				stack->saved_depth, stack->saved_max_depth, stack->depth + 1);
 
 	__memcpy(stack->saved_ids + d, stack->func_ids + d, len * sizeof(stack->saved_ids[0]));
 	__memcpy(stack->saved_res + d, stack->func_res + d, len * sizeof(stack->saved_res[0]));
 	__memcpy(stack->saved_lat + d, stack->func_lat + d, len * sizeof(stack->saved_lat[0]));
-	if (capture_args)
+	if (argsp->capture_args)
 		__memcpy(stack->saved_seq_ids + d, stack->seq_ids + d, len * sizeof(stack->saved_seq_ids[0]));
 
 	stack->saved_depth = stack->depth + 1;
@@ -412,15 +437,13 @@ static __noinline void save_stitch_stack(void *ctx, struct call_stack *stack)
 
 static const struct session empty_session;
 
-static bool emit_session_start(struct session *sess)
+static bool emit_session_start(void *ctx, struct session *sess)
 {
 	struct session_start *r;
 
-	r = bpf_ringbuf_reserve(&rb, sizeof(*r), 0);
-	if (!r) {
-		atomic_inc(&stats.dropped_sessions);
+	r = (struct session_start *)reserve_buf(sizeof(*r));
+	if (!r)
 		return false;
-	}
 
 	r->type = REC_SESSION_START;
 	r->pid = sess->pid;
@@ -429,7 +452,7 @@ static bool emit_session_start(struct session *sess)
 	__builtin_memcpy(r->task_comm, sess->task_comm, sizeof(sess->task_comm));
 	__builtin_memcpy(r->proc_comm, sess->proc_comm, sizeof(sess->proc_comm));
 
-	bpf_ringbuf_submit(r, 0);
+	submit_buf(ctx, r, sizeof(*r));
 
 	return true;
 }
@@ -437,10 +460,15 @@ static bool emit_session_start(struct session *sess)
 static __noinline bool push_call_stack(void *ctx, u32 id, u64 ip)
 {
 	u64 pid_tgid = bpf_get_current_pid_tgid();
-	u32 pid = (u32)pid_tgid;
+	u32 pid = (u32)pid_tgid, zero = 0;
 	struct session *sess;
 	int seq_id;
 	u64 d;
+	struct user_args *argsp;
+
+	argsp = bpf_map_lookup_elem(&ret_args_map, &zero);
+	if (!argsp)
+		return false;
 
 	sess = bpf_map_lookup_elem(&sessions, &pid);
 	if (!sess) {
@@ -452,7 +480,6 @@ static __noinline bool push_call_stack(void *ctx, u32 id, u64 ip)
 		bpf_map_update_elem(&sessions, &pid, &empty_session, BPF_ANY);
 		sess = bpf_map_lookup_elem(&sessions, &pid);
 		if (!sess) {
-			atomic_inc(&stats.dropped_sessions);
 			return false;
 		}
 
@@ -463,10 +490,10 @@ static __noinline bool push_call_stack(void *ctx, u32 id, u64 ip)
 		tsk = (void *)bpf_get_current_task();
 		BPF_CORE_READ_INTO(&sess->proc_comm, tsk, group_leader, comm);
 
-		if (emit_func_trace || capture_args) {
-			if (!emit_session_start(sess)) {
-				vlog("DEFUNCT SESSION TID/PID %d/%d: failed to send SESSION_START record!\n",
-				     sess->pid, sess->tgid);
+		if (argsp->emit_func_trace || argsp->capture_args) {
+			if (!emit_session_start(ctx, sess)) {
+				log("DEFUNCT SESSION TID/PID %d/%d: failed to send SESSION_START record!\n",
+						sess->pid, sess->tgid);
 				sess->defunct = true;
 				goto out_defunct;
 			} else {
@@ -500,14 +527,12 @@ out_defunct:
 	sess->stack.max_depth = d + 1;
 	sess->stack.func_lat[d] = bpf_ktime_get_ns();
 
-	if (emit_func_trace) {
+	if (argsp->emit_func_trace) {
 		struct func_trace_entry *fe;
 
-		fe = bpf_ringbuf_reserve(&rb, sizeof(*fe), 0);
-		if (!fe) {
-			stat_dropped_record(sess);
+		fe = (struct func_trace_entry *)reserve_buf(sizeof(*fe));
+		if (!fe)
 			goto skip_ft_entry;
-		}
 
 		fe->type = REC_FUNC_TRACE_ENTRY;
 		fe->ts = bpf_ktime_get_ns();
@@ -517,28 +542,27 @@ out_defunct:
 		fe->func_id = id;
 		fe->func_lat = 0;
 		fe->func_res = 0;
-
-		bpf_ringbuf_submit(fe, 0);
+		submit_buf(ctx, fe, sizeof(*fe));
 skip_ft_entry:;
 	}
 
-	if (capture_args)
+	if (argsp->capture_args)
 		record_args(ctx, sess, id, seq_id);
 
-	if (verbose) {
+	if (argsp->verbose) {
 		const char *func_name = func_info(id)->name;
 
 		if (printk_is_sane) {
 			if (d == 0)
 				log("=== STARTING TRACING %s [COMM %s PID %d] ===",
-				    func_name, sess->task_comm, pid);
-			log("    ENTER %s%s [...]", spaces + 2 * ((255 - d) & 0xFF), func_name);
+						func_name, sess->task_comm, pid);
+			//log("    ENTER %s%s [...]", spaces + 2 * ((255 - d) & 0xFF), func_name);
 		} else {
 			if (d == 0) {
 				log("=== STARTING TRACING %s [PID %d] ===", func_name, pid);
 				log("=== ...      TRACING [PID %d COMM %s] ===", pid, sess->task_comm);
 			}
-			log("    ENTER [%d] %s [...]", d + 1, func_name);
+			//log("    ENTER [%d] %s [...]", d + 1, func_name);
 		}
 	}
 
@@ -668,7 +692,7 @@ static __noinline void print_exit(void *ctx, __u32 d, __u32 id, long res)
 	}
 
 	if (printk_is_sane) {
-		bpf_trace_printk(fmt, FMT_MAX_SZ, spaces + 2 * ((255 - d) & 0xff), func_name, res);
+		//bpf_trace_printk(fmt, FMT_MAX_SZ, spaces + 2 * ((255 - d) & 0xff), func_name, res);
 	} else {
 		bpf_trace_printk(fmt, FMT_MAX_SZ, d + 1, func_name, res);
 	}
@@ -694,37 +718,41 @@ static int submit_session(void *ctx, struct session *sess)
 {
 	bool emit_session;
 	u64 emit_ts = bpf_ktime_get_ns();
+	u32 zero = 0;
+	struct user_args *argsp;
 
-	emit_session = sess->stack.is_err || emit_success_stacks;
-	if (duration_ns && emit_ts - sess->stack.func_lat[0] < duration_ns)
+	argsp = bpf_map_lookup_elem(&ret_args_map, &zero);
+	if (!argsp)
+		return 0;
+
+	emit_session = sess->stack.is_err || argsp->emit_success_stacks;
+	if (argsp->duration_ns && emit_ts - sess->stack.func_lat[0] < argsp->duration_ns)
 		emit_session = false;
-
+#if 0
 	if (emit_session) {
 		dlog("EMIT %s STACK DEPTH %d (SAVED ..%d)\n",
-		     sess->stack.is_err ? "ERROR" : "SUCCESS",
-		     sess->stack.max_depth, sess->stack.saved_max_depth);
+				sess->stack.is_err ? "ERROR" : "SUCCESS",
+				sess->stack.max_depth, sess->stack.saved_max_depth);
 	}
+#endif
 
 	if (emit_session && !sess->start_emitted) {
-		if (!emit_session_start(sess)) {
-			vlog("DEFUNCT SESSION TID/PID %d/%d: failed to send SESSION data!\n",
-			     sess->pid, sess->tgid);
+		if (!emit_session_start(ctx, sess)) {
+			log("DEFUNCT SESSION TID/PID %d/%d: failed to send SESSION data!\n",
+					sess->pid, sess->tgid);
 			sess->defunct = true;
 			return -EINVAL;
 		}
 		sess->start_emitted = true;
 	}
 
-	if (emit_session && use_lbr) {
+	if (emit_session) {
 		struct lbr_stack *r;
 
 		if (sess->lbrs_sz <= 0)
 			goto skip_lbrs;
-
-		r = bpf_ringbuf_reserve(&rb, sizeof(*r), 0);
+		r = (struct lbr_stack *)reserve_buf(sizeof(*r));
 		if (!r) {
-			/* record that we failed to submit LBR data */
-			stat_dropped_record(sess);
 			sess->lbrs_sz = -ENOSPC;
 			goto skip_lbrs;
 		}
@@ -734,18 +762,16 @@ static int submit_session(void *ctx, struct session *sess)
 		r->lbrs_sz = sess->lbrs_sz;
 		__memcpy(r->lbrs, sess->lbrs, sizeof(sess->lbrs));
 
-		bpf_ringbuf_submit(r, 0);
+		submit_buf(ctx, r, sizeof(*r));
 skip_lbrs:;
 	}
 
 	if (emit_session || sess->start_emitted) {
 		struct session_end *r;
 
-		r = bpf_ringbuf_reserve(&rb, sizeof(*r), 0);
-		if (!r) {
-			atomic_inc(&stats.dropped_sessions);
+		r = (struct session_end *)reserve_buf(sizeof(*r));
+		if (!r)
 			return -EINVAL;
-		}
 
 		r->type = REC_SESSION_END;
 		r->pid = sess->pid;
@@ -760,7 +786,7 @@ skip_lbrs:;
 		if (emit_session)
 			__memcpy(&r->stack, &sess->stack, sizeof(sess->stack));
 
-		bpf_ringbuf_submit(r, 0);
+		submit_buf(ctx, r, sizeof(*r));
 	}
 
 	return 0;
@@ -771,11 +797,16 @@ static __noinline bool pop_call_stack(void *ctx, u32 id, u64 ip, long res)
 	const struct func_info *fi;
 	const char *func_name;
 	struct session *sess;
-	u32 pid, exp_id, flags, fmt_sz;
+	u32 pid, exp_id, flags, fmt_sz, zero = 0;
 	const char *fmt;
 	bool failed;
 	u64 d, lat;
 	int seq_id;
+	struct user_args *argsp;
+
+	argsp = bpf_map_lookup_elem(&ret_args_map, &zero);
+	if (!argsp)
+		return false;
 
 	pid = (u32)bpf_get_current_pid_tgid();
 	sess = bpf_map_lookup_elem(&sessions, &pid);
@@ -788,8 +819,8 @@ static __noinline bool pop_call_stack(void *ctx, u32 id, u64 ip, long res)
 		if (sess->stack.depth == 0) {
 			reset_session(sess);
 			bpf_map_delete_elem(&sessions, &pid);
-			vlog("DEFUNCT SESSION TID/PID %d/%d: SESSION_END, no data was collected!\n",
-			     pid, sess->tgid);
+			log("DEFUNCT SESSION TID/PID %d/%d: SESSION_END, no data was collected!\n",
+					pid, sess->tgid);
 		}
 		return false;
 	}
@@ -830,14 +861,11 @@ static __noinline bool pop_call_stack(void *ctx, u32 id, u64 ip, long res)
 
 	lat = bpf_ktime_get_ns() - sess->stack.func_lat[d];
 
-	if (emit_func_trace) {
+	if (argsp->emit_func_trace) {
 		struct func_trace_entry *fe;
-
-		fe = bpf_ringbuf_reserve(&rb, sizeof(*fe), 0);
-		if (!fe) {
-			stat_dropped_record(sess);
+                fe = (struct func_trace_entry *)reserve_buf(sizeof(*fe));
+	        if (!fe)
 			goto skip_ft_exit;
-		}
 
 		fe->type = REC_FUNC_TRACE_EXIT;
 		fe->ts = bpf_ktime_get_ns();
@@ -847,25 +875,23 @@ static __noinline bool pop_call_stack(void *ctx, u32 id, u64 ip, long res)
 		fe->func_id = id;
 		fe->func_lat = lat;
 		fe->func_res = res;
-
-		bpf_ringbuf_submit(fe, 0);
+                submit_buf(ctx, fe, sizeof(*fe));
 skip_ft_exit:;
 	}
-	if (verbose)
+	if (argsp->verbose)
 		print_exit(ctx, d, id, res);
 
 	exp_id = sess->stack.func_ids[d];
 	if (exp_id != id) {
 		const struct func_info *exp_fi = func_info(exp_id);
 
-		vlog("POP(0) UNEXPECTED PID %d DEPTH %d MAX DEPTH %d",
-		     pid, sess->stack.depth, sess->stack.max_depth);
-		vlog("POP(1) UNEXPECTED GOT  ID %d ADDR %lx NAME %s",
-		     id, ip, func_name);
-		vlog("POP(2) UNEXPECTED WANT ID %u ADDR %lx NAME %s",
-		     exp_id, exp_fi->ip, exp_fi->name);
+		log("POP(0) UNEXPECTED PID %d DEPTH %d MAX DEPTH %d",
+				pid, sess->stack.depth, sess->stack.max_depth);
+		log("POP(1) UNEXPECTED GOT  ID %d ADDR %lx NAME %s",
+				id, ip, func_name);
+		log("POP(2) UNEXPECTED WANT ID %u ADDR %lx NAME %s",
+				exp_id, exp_fi->ip, exp_fi->name);
 
-		atomic_inc(&stats.dropped_sessions);
 		reset_session(sess);
 		bpf_map_delete_elem(&sessions, &pid);
 
@@ -879,10 +905,8 @@ skip_ft_exit:;
 		sess->stack.is_err = true;
 		sess->stack.max_depth = d + 1;
 		sess->stack.kstack_sz = bpf_get_stack(ctx, &sess->stack.kstack, sizeof(sess->stack.kstack), 0);
-		sess->lbrs_sz = copy_lbrs(&sess->lbrs, sizeof(sess->lbrs));
-	} else if (emit_success_stacks && d + 1 == sess->stack.max_depth) {
+	} else if (argsp->emit_success_stacks && d + 1 == sess->stack.max_depth) {
 		sess->stack.kstack_sz = bpf_get_stack(ctx, &sess->stack.kstack, sizeof(sess->stack.kstack), 0);
-		sess->lbrs_sz = copy_lbrs(&sess->lbrs, sizeof(sess->lbrs));
 	}
 	sess->stack.depth = d;
 
@@ -901,10 +925,15 @@ skip_ft_exit:;
 static __always_inline bool tgid_allowed(void)
 {
 	bool *verdict_ptr;
-	u32 tgid;
+	u32 tgid, zero = 0;
+	struct user_args *argsp;
+
+	argsp = bpf_map_lookup_elem(&ret_args_map, &zero);
+	if (!argsp)
+		return true;
 
 	/* if no PID filters -- allow everything */
-	if (tgid_allow_cnt + tgid_deny_cnt == 0)
+	if (argsp->tgid_allow_cnt + argsp->tgid_deny_cnt == 0)
 		return true;
 
 	tgid = bpf_get_current_pid_tgid() >> 32;
@@ -912,7 +941,7 @@ static __always_inline bool tgid_allowed(void)
 	verdict_ptr = bpf_map_lookup_elem(&tgids_filter, &tgid);
 	if (!verdict_ptr)
 		/* if allowlist is non-empty, then PID didn't pass the check */
-		return tgid_allow_cnt == 0;
+		return argsp->tgid_allow_cnt == 0;
 
 	return *verdict_ptr;
 }
@@ -921,9 +950,15 @@ static __always_inline bool comm_allowed(void)
 {
 	char comm[TASK_COMM_LEN] = {};
 	bool *verdict_ptr;
+	u32 zero = 0;
+	struct user_args *argsp;
+
+	argsp = bpf_map_lookup_elem(&ret_args_map, &zero);
+	if (!argsp)
+		return true;
 
 	/* if no COMM filters -- allow everything */
-	if (comm_allow_cnt + comm_deny_cnt == 0)
+	if (argsp->comm_allow_cnt + argsp->comm_deny_cnt == 0)
 		return true;
 
 	bpf_get_current_comm(comm, TASK_COMM_LEN);
@@ -931,13 +966,13 @@ static __always_inline bool comm_allowed(void)
 	verdict_ptr = bpf_map_lookup_elem(&comms_filter, comm);
 	if (!verdict_ptr)
 		/* if allowlist is non-empty, then COMM didn't pass the check */
-		return comm_allow_cnt == 0;
+		return argsp->comm_allow_cnt == 0;
 
 	return *verdict_ptr;
 }
 
 /* mass-attacher BPF library is calling this function, so it should be global */
-__hidden int handle_func_entry(void *ctx, u32 func_id, u64 func_ip)
+int handle_func_entry(void *ctx, u32 func_id, u64 func_ip)
 {
 	if (!tgid_allowed() || !comm_allowed())
 		return 0;
@@ -947,11 +982,158 @@ __hidden int handle_func_entry(void *ctx, u32 func_id, u64 func_ip)
 }
 
 /* mass-attacher BPF library is calling this function, so it should be global */
-__hidden int handle_func_exit(void *ctx, u32 func_id, u64 func_ip, u64 ret)
+int handle_func_exit(void *ctx, u32 func_id, u64 func_ip, u64 ret)
 {
 	if (!tgid_allowed() || !comm_allowed())
 		return 0;
 
 	pop_call_stack(ctx, func_id, func_ip, ret);
 	return 0;
+}
+
+
+/*=========================================================================*/
+#define likely(x) __builtin_expect(!!(x), 1)
+#define unlikely(x) __builtin_expect(!!(x), 0)
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__type(key, __u64);
+	__type(value, unsigned);
+} ip_to_id SEC(".maps");
+
+#define MAX_LBR_ENTRIES 32
+
+/* feature detection/calibration inputs */
+// const volatile int kret_ip_off = 0;
+
+/* Kernel protects from the same BPF program from refiring on the same CPU.
+ * Unfortunately, it's not very useful for us right now, because each attached
+ * fentry/fexit is a separate BPF, so we need to still protected ourselves.
+ */
+
+//const volatile __u32 max_cpu_mask;
+
+/* dynamically sized arrays */
+//static int running[1] SEC(".data.running");
+
+/* has to be called from entry-point BPF program if not using
+ * bpf_get_func_ip()
+ */
+static __always_inline u64 get_kret_func_ip(void *ctx, int kret_ip_off)
+{
+	struct trace_kprobe *tk;
+	u64 fp, ip;
+
+	/* get frame pointer */
+	asm volatile ("%[fp] = r10" : [fp] "+r"(fp) :);
+
+	bpf_probe_read_kernel(&tk, sizeof(tk), (void *)(fp + kret_ip_off * sizeof(__u64)));
+	ip = (__u64)BPF_CORE_READ(tk, rp.kp.addr);
+	return ip;
+}
+
+SEC("kprobe")
+int kentry(struct pt_regs *ctx)
+{
+	const char *name;
+	long ip;
+	u32 id, zero = 0;
+	struct user_args *args = NULL;
+
+	args = bpf_map_lookup_elem(&ret_args_map, &zero);
+	if (!args || !args->ready)
+		return 0;
+
+#ifdef bpf_target_x86
+	/* for x86 the IP is off by one at hardware level,
+		* see https://github.com/anakryiko/retsnoop/issues/32
+		*/
+	ip = PT_REGS_IP(ctx) - 1;
+#else
+	ip = PT_REGS_IP(ctx);
+#endif
+
+	u32 *id_ptr;
+
+	id_ptr = bpf_map_lookup_elem(&ip_to_id, &ip);
+	if (!id_ptr) {
+		bpf_printk("KENTRY UNRECOGNIZED IP %lx", ip);
+		return 0;
+	}
+
+	id = *id_ptr;
+
+	handle_func_entry(ctx, id, ip);
+	return 0;
+}
+
+SEC("kretprobe")
+int kexit(struct pt_regs *ctx)
+{
+	const char *name;
+	u32 id, cpu, zero = 0;
+	long ip;
+	struct user_args *argsp = NULL;
+
+	argsp = bpf_map_lookup_elem(&ret_args_map, &zero);
+	if (unlikely(!argsp) || unlikely(!argsp->ready))
+		return 0;
+
+	cpu = bpf_get_smp_processor_id();
+#if 0
+	capture_lbrs(cpu);
+#endif
+
+	ip = get_kret_func_ip(ctx, argsp->kret_ip_off);
+
+	u32 *id_ptr;
+
+	id_ptr = bpf_map_lookup_elem(&ip_to_id, &ip);
+	if (!id_ptr) {
+		bpf_printk("KEXIT UNRECOGNIZED IP %lx", ip);
+		return 0;
+	}
+
+	id = *id_ptr;
+
+	handle_func_exit(ctx, id, ip, PT_REGS_RC(ctx));
+
+	return 0;
+}
+
+#if 0
+static __always_inline bool recur_enter(u32 cpu)
+{
+	if (running[cpu & max_cpu_mask])
+		return false;
+
+	running[cpu & max_cpu_mask] += 1;
+
+	return true;
+}
+
+static __always_inline void recur_exit(u32 cpu)
+{
+	running[cpu & max_cpu_mask] -= 1;
+}
+#endif
+
+static __always_inline u64 get_ftrace_func_ip(void *ctx, int arg_cnt)
+{
+	u64 off = 1 /* skip orig rbp */
+		+ 1 /* skip reserved space for ret value */;
+	u64 ip;
+
+	if (arg_cnt <= 6)
+		off += arg_cnt;
+	else
+		off += 6;
+	off = (u64)ctx + off * 8;
+
+	if (bpf_probe_read_kernel(&ip, sizeof(ip), (void *)off))
+		return 0;
+
+	ip -= 5; /* compensate for 5-byte fentry stub */
+	return ip;
 }

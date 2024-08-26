@@ -17,6 +17,8 @@
 
 #define TASK_COMM_LEN 16
 
+#define FUNC_INFO_SIZE 10000
+
 struct stats {
 	long dropped_sessions;
 	long incomplete_sessions;
@@ -199,5 +201,44 @@ struct session_end {
 #ifndef EDOM
 #define EDOM 33
 #endif
+
+struct user_args {
+	bool ready;
+
+	bool verbose;
+	bool extra_verbose;
+	bool emit_call_stack;	
+	bool emit_func_trace;	
+	bool emit_success_stacks;
+	bool capture_args;	
+	bool capture_raw_ptrs;
+	bool use_kprobes;
+	int args_max_total_args_sz;
+	int args_max_sized_arg_sz;
+	int args_max_str_arg_sz;
+	int args_max_any_arg_sz;
+
+	unsigned int tgid_allow_cnt;
+	unsigned int tgid_deny_cnt;
+
+	__u32 comm_allow_cnt;
+	__u32 comm_deny_cnt;
+	__u64 duration_ns;	
+	//const volatile char spaces[512];
+	int func_info_mask;
+
+	int kret_ip_off;
+	int my_tid;
+	__u64 entry_ip;
+	bool calib_entry_happened;
+	bool calib_exit_happened;
+	bool has_fexit_sleep_fix;
+};
+
+struct func_info_elem {
+        struct func_info func_infos[FUNC_INFO_SIZE];
+        int func_info_mask;
+};
+
 
 #endif /* __RETSNOOP_H */

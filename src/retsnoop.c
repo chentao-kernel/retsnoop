@@ -24,6 +24,34 @@
 #include "addr2line.h"
 #include "mass_attacher.h"
 #include "utils.h"
+#include "compat.h"
+
+struct user_args args = {
+	.ready = false,
+	.verbose = false,
+	.emit_call_stack = true,
+	.emit_func_trace = true,
+	.emit_success_stacks = false,
+	.capture_args = true,
+	.capture_raw_ptrs = true,
+	.use_kprobes = true,
+	.args_max_total_args_sz = DEFAULT_FNARGS_TOTAL_ARGS_SZ,
+	.args_max_sized_arg_sz = DEFAULT_FNARGS_SIZED_ARG_SZ,
+	.args_max_str_arg_sz = DEFAULT_FNARGS_STR_ARG_SZ,
+	.args_max_any_arg_sz = DEFAULT_FNARGS_SIZED_ARG_SZ > DEFAULT_FNARGS_STR_ARG_SZ
+				       ? DEFAULT_FNARGS_SIZED_ARG_SZ
+				       : DEFAULT_FNARGS_STR_ARG_SZ,
+	.tgid_allow_cnt = -1,
+	.tgid_deny_cnt = -1,
+	.comm_allow_cnt = -1,
+	.duration_ns = -1,
+	.comm_deny_cnt = -1,
+	.kret_ip_off = 0,
+	.my_tid = 0,
+	.entry_ip = 0,
+	.calib_entry_happened = false,
+	.calib_exit_happened = false,
+};
 
 static int process_cu_globs()
 {
@@ -97,6 +125,8 @@ static int detect_kernel_features(void)
 {
 	struct calib_feat_bpf *skel;
 	int err;
+	uint32_t zero = 0;
+	struct user_args user_args = {0};
 
 	skel = calib_feat_bpf__open_and_load();
 	if (!skel) {
@@ -105,13 +135,8 @@ static int detect_kernel_features(void)
 		return err;
 	}
 
-	if (!skel->bss) {
-		fprintf(stderr, "Kernel doesn't support memory mapping BPF global vars, you might need newer Linux kernel.\n");
-		err = -EOPNOTSUPP;
-		goto out;
-	}
-
-	skel->bss->my_tid = syscall(SYS_gettid);
+        args.my_tid = syscall(SYS_gettid);
+        bpf_map_update_elem(bpf_map__fd(skel->maps.calib_args_map), &args, &zero, 0);
 
 	err = calib_feat_bpf__attach(skel);
 	if (err) {
@@ -122,35 +147,16 @@ static int detect_kernel_features(void)
 	/* trigger ksyscall and kretsyscall probes */
 	syscall(__NR_nanosleep, NULL, NULL);
 
-	if (!skel->bss->calib_entry_happened || !skel->bss->calib_exit_happened) {
-		fprintf(stderr, "Calibration failure, BPF probes weren't triggered!\n");
-		goto out;
+	err = bpf_map_lookup_elem(bpf_map__fd(skel->maps.calib_args_map), &user_args, &zero);
+        if (err) {
+		fprintf(stderr, "args map look up failed\n");
+		return -1;
 	}
 
 	if (env.debug) {
-		printf("Feature detection:\n"
-		       "\tBPF ringbuf map supported: %s\n"
-		       "\tbpf_get_func_ip() supported: %s\n"
-		       "\tbpf_get_branch_snapshot() supported: %s\n"
-		       "\tBPF cookie supported: %s\n"
-		       "\tmulti-attach kprobe supported: %s\n",
-		       skel->bss->has_ringbuf ? "yes" : "no",
-		       skel->bss->has_bpf_get_func_ip ? "yes" : "no",
-		       skel->bss->has_branch_snapshot ? "yes" : "no",
-		       skel->bss->has_bpf_cookie ? "yes" : "no",
-		       skel->bss->has_kprobe_multi ? "yes" : "no");
 		printf("Feature calibration:\n"
-		       "\tkretprobe IP offset: %d\n"
-		       "\tfexit sleep fix: %s\n"
-		       "\tfentry re-entry protection: %s\n",
-		       skel->bss->kret_ip_off,
-		       skel->bss->has_fexit_sleep_fix ? "yes" : "no",
-		       skel->bss->has_fentry_protection ? "yes" : "no");
+		       "\tkretprobe IP offset: %d\n", user_args.kret_ip_off);
 	}
-
-	env.has_ringbuf = skel->bss->has_ringbuf;
-	env.has_branch_snapshot = skel->bss->has_branch_snapshot;
-
 out:
 	calib_feat_bpf__destroy(skel);
 	return err;
@@ -214,14 +220,15 @@ static void sig_handler(int sig)
 	signal(SIGTERM, SIG_DFL);
 }
 
+struct func_info_elem elem;
+
 const struct func_info *func_info(const struct ctx *ctx, __u32 id)
 {
-	return &ctx->skel->data_func_infos->func_infos[id];
-}
+        uint32_t zero = 0;
 
-long read_dropped_sessions(void)
-{
-	return atomic_load(&env.ctx.skel->bss->stats.dropped_sessions);
+        bpf_map_lookup_elem(bpf_map__fd(ctx->skel->maps.func_infos_map), &elem, &zero);
+
+	return &elem.func_infos[id];
 }
 
 int main(int argc, char **argv, char **envp)
@@ -230,7 +237,8 @@ int main(int argc, char **argv, char **envp)
 	struct ksyms *ksyms = NULL;
 	struct mass_attacher *att = NULL;
 	struct retsnoop_bpf *skel = NULL;
-	struct ring_buffer *rb = NULL;
+	struct bpf_buffer *bf = NULL;
+
 	int *lbr_perf_fds = NULL;
 	char vmlinux_path[1024] = {};
 	const struct ksym *stext_sym = 0;
@@ -342,12 +350,6 @@ int main(int argc, char **argv, char **envp)
 		err = -EINVAL;
 		goto cleanup_silent;
 	}
-
-	if (!env.has_ringbuf) {
-		fprintf(stderr, "Retsnoop requires BPF ringbuf (Linux 5.8+), please upgrade your kernel!\n");
-		err = -EOPNOTSUPP;
-		goto cleanup_silent;
-	}
 #ifndef __x86_64__
 	if (env.capture_args) {
 		elog("Function arguments capture is only supported on x86-64 architecture!\n");
@@ -373,67 +375,42 @@ int main(int argc, char **argv, char **envp)
 		goto cleanup_silent;
 	}
 
-	bpf_map__set_max_entries(skel->maps.rb, env.ringbuf_map_sz);
+	//bpf_map__set_max_entries(skel->maps.rb, env.ringbuf_map_sz);
 	bpf_map__set_max_entries(skel->maps.sessions, env.sessions_map_sz);
 
-	skel->rodata->tgid_allow_cnt = env.allow_pid_cnt;
-	skel->rodata->tgid_deny_cnt = env.deny_pid_cnt;
+	args.tgid_allow_cnt = env.allow_pid_cnt;
+	args.tgid_deny_cnt = env.deny_pid_cnt;
 	if (env.allow_pid_cnt + env.deny_pid_cnt > 0) {
 		bpf_map__set_max_entries(skel->maps.tgids_filter,
 					 env.allow_pid_cnt + env.deny_pid_cnt);
 	}
 
-	skel->rodata->comm_allow_cnt = env.allow_comm_cnt;
-	skel->rodata->comm_deny_cnt = env.deny_comm_cnt;
+	args.comm_allow_cnt = env.allow_comm_cnt;
+	args.comm_deny_cnt = env.deny_comm_cnt;
 	if (env.allow_comm_cnt + env.deny_comm_cnt > 0) {
 		bpf_map__set_max_entries(skel->maps.comms_filter,
 					 env.allow_comm_cnt + env.deny_comm_cnt);
 	}
 
 	/* turn on extra bpf_printk()'s on BPF side */
-	skel->rodata->verbose = env.debug_feats & DEBUG_BPF;
-	skel->rodata->extra_verbose = (env.debug_feats & DEBUG_BPF) && env.debug_extra;
-	skel->rodata->emit_success_stacks = env.emit_success_stacks > 0;
-	skel->rodata->duration_ns = env.longer_than_ms * 1000000ULL;
-	skel->rodata->use_kprobes = env.attach_mode != ATTACH_FENTRY;
-	memset(skel->rodata->spaces, ' ', sizeof(skel->rodata->spaces) - 1);
+	args.verbose = env.debug_feats & DEBUG_BPF;
+	args.extra_verbose = (env.debug_feats & DEBUG_BPF) && env.debug_extra;
+	args.emit_success_stacks = env.emit_success_stacks > 0;
+	args.duration_ns = env.longer_than_ms * 1000000ULL;
+	args.use_kprobes = env.attach_mode != ATTACH_FENTRY;
+	//memset(args.spaces, ' ', sizeof(args.spaces) - 1);
 
-	skel->rodata->capture_args = env.capture_args;
-	skel->rodata->capture_raw_ptrs = env.args_capture_raw_ptrs;
-	skel->rodata->args_max_total_args_sz = env.args_max_total_args_size;
-	skel->rodata->args_max_sized_arg_sz = env.args_max_sized_arg_size;
-	skel->rodata->args_max_str_arg_sz = env.args_max_str_arg_size;
-	skel->rodata->args_max_any_arg_sz = max(env.args_max_sized_arg_size, env.args_max_str_arg_size);
+	args.capture_args = env.capture_args;
+	args.capture_raw_ptrs = env.args_capture_raw_ptrs;
+	args.args_max_total_args_sz = env.args_max_total_args_size;
+	args.args_max_sized_arg_sz = env.args_max_sized_arg_size;
+	args.args_max_str_arg_sz = env.args_max_str_arg_size;
+	args.args_max_any_arg_sz = max(env.args_max_sized_arg_size, env.args_max_str_arg_size);
 	if (env.args_capture_raw_ptrs)
-		skel->rodata->args_max_any_arg_sz += 8; /* for raw pointer value */
+		args.args_max_any_arg_sz += 8; /* for raw pointer value */
 
-	/* LBR detection and setup */
-	if (env.use_lbr && env.has_branch_snapshot) {
-		lbr_perf_fds = malloc(sizeof(int) * env.cpu_cnt);
-		if (!lbr_perf_fds) {
-			err = -ENOMEM;
-			goto cleanup_silent;
-		}
-		for (i = 0; i < env.cpu_cnt; i++) {
-			lbr_perf_fds[i] = -1;
-		}
-
-		err = create_lbr_perf_events(lbr_perf_fds, env.cpu_cnt);
-		if (err) {
-			if (env.verbose)
-				fprintf(stderr, "Failed to create LBR perf events: %d. Disabling LBR capture.\n", err);
-			err = 0;
-		} else {
-			env.has_lbr = true;
-		}
-	}
-	env.use_lbr = env.use_lbr && env.has_lbr && env.has_branch_snapshot;
-	skel->rodata->use_lbr = env.use_lbr;
-	if (env.use_lbr && env.verbose)
-		printf("LBR capture enabled.\n");
-
-	skel->rodata->emit_call_stack = env.emit_call_stack;
-	skel->rodata->emit_func_trace = env.emit_func_trace;
+	args.emit_call_stack = env.emit_call_stack;
+	args.emit_func_trace = env.emit_func_trace;
 
 	att_opts.verbose = env.verbose;
 	att_opts.debug = env.debug;
@@ -470,7 +447,7 @@ int main(int argc, char **argv, char **envp)
 	}
 	for (i = 0; i < env.allow_glob_cnt; i++) {
 		struct glob *g = &env.allow_globs[i];
-
+                // 通配符匹配
 		err = mass_attacher__allow_glob(att, g->name, g->mod);
 		if (err)
 			goto cleanup_silent;
@@ -504,13 +481,13 @@ int main(int argc, char **argv, char **envp)
 			goto cleanup_silent;
 		}
 	}
-	skel->rodata->func_info_mask = tmp_n - 1;
-	err = bpf_map__set_value_size(skel->maps.data_func_infos, tmp_n * sizeof(struct func_info));
+	args.func_info_mask = tmp_n - 1;
+	err = bpf_map__set_value_size(skel->maps.func_infos_map, tmp_n * sizeof(struct func_info));
 	if (err) {
 		fprintf(stderr, "Failed to dynamically size func info table: %d\n", err);
 		goto cleanup_silent;
 	}
-	skel->data_func_infos = bpf_map__initial_value(skel->maps.data_func_infos, &tmp_n);
+	//skel->data_func_infos = bpf_map__initial_value(skel->maps.data_func_infos, &tmp_n);
 
 	if (env.capture_args) {
 		for (i = 0; i < n; i++) {
@@ -671,11 +648,17 @@ int main(int argc, char **argv, char **envp)
 	}
 
 	/* Set up ring/perf buffer polling */
-	rb = ring_buffer__new(bpf_map__fd(skel->maps.rb), handle_event, &env.ctx, NULL);
-	if (!rb) {
+	bf = bpf_buffer__new(skel->maps.events, skel->maps.heap);
+	if (!bf) {
 		err = -1;
 		fprintf(stderr, "Failed to create ring buffer\n");
 		goto cleanup;
+	}
+
+	err = bpf_buffer__open(bf, handle_event, handle_lost_event, &env.ctx);	
+	if (err) {
+		fprintf(stderr, "Failed to open bpf buffer:%s\n", strerror(err));
+		goto cleanup_buffer;
 	}
 
 	/* Allow mass tracing */
@@ -686,31 +669,22 @@ int main(int argc, char **argv, char **envp)
 		printf("BPF-side logging is enabled. Use `sudo cat /sys/kernel/tracing/trace_pipe` to see logs.\n");
 	printf("Receiving data...\n");
 	while (!exiting) {
-		err = ring_buffer__poll(rb, 100);
+		err = bpf_buffer__poll(bf, 100);
 		/* Ctrl-C will cause -EINTR */
 		if (err == -EINTR) {
 			err = 0;
-			goto cleanup;
+			goto cleanup_buffer;
 		}
 		if (err < 0) {
 			printf("Error polling perf buffer: %d\n", err);
-			goto cleanup;
+			goto cleanup_buffer;
 		}
 	}
 
+cleanup_buffer:
+	bpf_buffer__free(bf);	
 cleanup:
 	printf("\nDetaching...\n");
-
-	if (env.ctx.skel && env.ctx.skel->bss) {
-		long dropped_sessions = read_dropped_sessions();
-		long incomplete_sessions = atomic_load(&env.ctx.skel->bss->stats.incomplete_sessions);
-
-		if (dropped_sessions || incomplete_sessions) {
-			fprintf(stderr, "WARNING! There were dropped or incomplete data. Output might be incomplete!\n");
-			fprintf(stderr, "%-20s %ld\n", "DROPPED SAMPLES:", dropped_sessions);
-			fprintf(stderr, "%-20s %ld\n", "INCOMPLETE SAMPLES:", incomplete_sessions);
-		}
-	}
 
 cleanup_silent:
 	fflush(stdout);

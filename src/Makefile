@@ -131,7 +131,7 @@ $(OUTPUT)/%.o: %.c $(wildcard *.h) $(LIBBPF_OBJ) | $(OUTPUT) $(OUTPUT)/tests
 	$(call msg,CC,$@)
 	$(Q)$(CC) $(CFLAGS) $(INCLUDES) -c $(filter %.c,$^) -o $@
 
-$(OUTPUT)/retsnoop.skel.h: $(OUTPUT)/mass_attach.bpf.o
+#$(OUTPUT)/retsnoop.skel.h: $(OUTPUT)/mass_attach.bpf.o
 $(OUTPUT)/retsnoop.o: $(OUTPUT)/retsnoop.skel.h $(OUTPUT)/calib_feat.skel.h
 $(OUTPUT)/mass_attacher.o: $(OUTPUT)/retsnoop.skel.h $(OUTPUT)/calib_feat.skel.h
 
@@ -158,6 +158,7 @@ retsnoop: override CFLAGS += -DSKEL_NAME=retsnoop_bpf			\
 
 retsnoop: $(addprefix $(OUTPUT)/,					\
 		      retsnoop.o					\
+		      compat.o 						\
 		      logic.o 						\
 		      fnargs.o 						\
 		      env.o						\

@@ -1166,7 +1166,7 @@ static int handle_session_end(struct ctx *dctx, struct session *sess, const stru
 		print_ft_items(dctx, &stack_items1);
 	}
 
-	if (!env.emit_call_stack && !env.use_lbr)
+	if (!env.emit_call_stack)
 		goto skip_call_stack;
 
 	fstack_n = filter_fstack(dctx, fstack, s);
@@ -1196,16 +1196,6 @@ static int handle_session_end(struct ctx *dctx, struct session *sess, const stru
 		}
 	}
 
-	/* LBR output */
-	if (env.use_lbr) {
-		if (r->lbrs_sz > 0 && !sess->lbrs)
-			printf("LBR data was dropped and is missing in this sample!\n");
-		else if (r->lbrs_sz < 0)
-			printf("Failed to capture LBR entries: %d\n", r->lbrs_sz);
-		else
-			output_lbrs(dctx, sess, fn_start, fn_end);
-	}
-
 	/* Emit combined fstack/kstack + errors stack trace */
 	if (env.emit_call_stack)
 		output_call_stack(dctx, sess, fstack, fstack_n, kstack, kstack_n);
@@ -1224,18 +1214,15 @@ out_purge:
 	return ret;
 }
 
+void handle_lost_event(void *ctx, int cpu, size_t lost_cnt)
+{
+	fprintf(stderr, "Lost %llu events on CPU #%d!\n", lost_cnt, cpu);
+}
+
 int handle_event(void *ctx, void *data, size_t data_sz)
 {
 	enum rec_type type = *(enum rec_type *)data;
-	static long prev_dropped_sessions;
-	long cur_dropped_sessions = read_dropped_sessions();
 	struct session *sess;
-
-	if (cur_dropped_sessions != prev_dropped_sessions) {
-		printf("WARNING! %ld samples were dropped, you are missing data! Consider increasing --ringbuf-map-size.\n",
-		       cur_dropped_sessions - prev_dropped_sessions);
-		prev_dropped_sessions = cur_dropped_sessions;
-	}
 
 	switch (type) {
 	case REC_SESSION_START:

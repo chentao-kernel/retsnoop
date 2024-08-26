@@ -18,6 +18,8 @@
 #include "utils.h"
 #include "logic.h"
 
+extern struct user_args args;
+
 #ifndef SKEL_NAME
 #error "Please define -DSKEL_NAME=<BPF skeleton name> for mass_attacher"
 #endif
@@ -213,9 +215,6 @@ void mass_attacher__free(struct mass_attacher *att)
 	if (!att)
 		return;
 
-	if (att->skel)
-		att->skel->bss->ready = false;
-
 	btf__free(att->vmlinux_btf);
 	for (i = 0; i < att->mod_btf_cnt; i++)
 		btf__free(att->mod_btfs[i]);
@@ -324,9 +323,6 @@ int mass_attacher__prepare(struct mass_attacher *att)
 		return err;
 	}
 
-	att->use_kprobe_multi = !att->use_fentries && att->has_kprobe_multi
-				&& att->attach_mode != MASS_ATTACH_KPROBE_SINGLE;
-
 	if (att->use_fentries && !att->has_fexit_sleep_fix) {
 		for (i = 0; i < ARRAY_SIZE(sleepable_deny_globs); i++) {
 			err = glob_set__add_glob(&att->globs, sleepable_deny_globs[i], NULL,
@@ -338,11 +334,7 @@ int mass_attacher__prepare(struct mass_attacher *att)
 			}
 		}
 	}
-
-	att->skel->rodata->kret_ip_off = att->kret_ip_off;
-	att->skel->rodata->has_fentry_protection = att->has_fentry_protection;
-	att->skel->rodata->has_bpf_get_func_ip = att->has_bpf_get_func_ip;
-	att->skel->rodata->has_bpf_cookie = att->has_bpf_cookie;
+	args.kret_ip_off = att->kret_ip_off;
 
 	/* round up actual CPU count to the closest power-of-2 */
 	cpu_cnt = libbpf_num_possible_cpus();
@@ -350,13 +342,6 @@ int mass_attacher__prepare(struct mass_attacher *att)
 		/* nothing */
 	}
 	cpu_cnt = tmp_cnt;
-	att->skel->rodata->max_cpu_mask = cpu_cnt - 1;
-
-	/* resize per-CPU global arrays */
-	if (!resize_map(att->skel->maps.data_lbrs, cpu_cnt) ||
-	    !resize_map(att->skel->maps.data_lbr_szs, cpu_cnt) ||
-	    !resize_map(att->skel->maps.data_running, cpu_cnt))
-		return -EINVAL;
 
 	/* Load names of attachable kprobes matching glob specs */
 	err = load_matching_kprobes(att);
@@ -364,7 +349,7 @@ int mass_attacher__prepare(struct mass_attacher *att)
 		elog("Failed to read the list of available kprobes: %d\n", err);
 		return err;
 	}
-
+#if 0
 	_Static_assert(MAX_FUNC_ARG_CNT == 6, "Unexpected maximum function arg count");
 	att->fentries[0] = att->skel->progs.fentry0;
 	att->fentries[1] = att->skel->progs.fentry1;
@@ -387,6 +372,7 @@ int mass_attacher__prepare(struct mass_attacher *att)
 	att->fexit_voids[4] = att->skel->progs.fexit_void4;
 	att->fexit_voids[5] = att->skel->progs.fexit_void5;
 	att->fexit_voids[6] = att->skel->progs.fexit_void6;
+#endif
 
 	att->vmlinux_btf = libbpf_find_kernel_btf();
 	err = libbpf_get_error(att->vmlinux_btf);
@@ -571,40 +557,39 @@ static int calibrate_features(struct mass_attacher *att)
 {
 	struct calib_feat_bpf *skel;
 	int err;
+	struct user_args *argsp;
+	uint32_t zero = 0;
 
 	skel = calib_feat_bpf__open_and_load();
 	if (!skel) {
 		elog("Failed to load feature calibration skeleton\n");
 		return -EFAULT;
 	}
-
-	skel->bss->my_tid = syscall(SYS_gettid);
+	
+	args.my_tid = syscall(SYS_gettid);
+	bpf_map_update_elem(bpf_map__fd(skel->maps.calib_args_map), &args, &zero, 0);
 
 	err = calib_feat_bpf__attach(skel);
 	if (err) {
 		elog("Failed to attach feature calibration skeleton\n");
 		goto err_out;
 	}
-
+	
 	/* trigger ksyscall and kretsyscall probes */
 	syscall(__NR_nanosleep, NULL, NULL);
 
-	if (!skel->bss->calib_entry_happened || !skel->bss->calib_exit_happened) {
-		elog("Calibration failure, BPF probes weren't triggered!\n");
-		goto err_out;
+	err = bpf_map_lookup_elem(bpf_map__fd(skel->maps.calib_args_map), &args, &zero);
+	if (!err) {
+		fprintf(stderr, "args map look up failed\n");
+		return -1;
 	}
 
-	if (!skel->bss->has_bpf_get_func_ip && skel->bss->kret_ip_off == 0) {
+	if (args.kret_ip_off == 0) {
 		elog("Failed to calibrate kretprobe func IP extraction.\n");
 		goto err_out;
 	}
-
-	att->kret_ip_off = skel->bss->kret_ip_off;
-	att->has_bpf_get_func_ip = skel->bss->has_bpf_get_func_ip;
-	att->has_fexit_sleep_fix = skel->bss->has_fexit_sleep_fix;
-	att->has_fentry_protection = skel->bss->has_fentry_protection;
-	att->has_bpf_cookie = skel->bss->has_bpf_cookie;
-	att->has_kprobe_multi = skel->bss->has_kprobe_multi;
+	
+	att->kret_ip_off = args.kret_ip_off;
 
 	calib_feat_bpf__destroy(skel);
 	return 0;
@@ -1106,13 +1091,17 @@ int mass_attacher__attach(struct mass_attacher *att)
 skip_attach:
 		if (att->debug) {
 			char flags_buf[256];
-
-			format_func_flags(flags_buf, sizeof(flags_buf),
-					  att->skel->data_func_infos->func_infos[i].flags);
+                        uint32_t zero = 0;
+                        struct func_info_elem *elem = calloc(1, sizeof(struct func_info_elem));
+                        if (!elem)
+                                goto err_out;
+                        bpf_map_lookup_elem(bpf_map__fd(att->skel->maps.func_infos_map), elem, &zero);
+			format_func_flags(flags_buf, sizeof(flags_buf), elem->func_infos[i].flags);
 			log("Attached%s to function #%d '%s%s%s%s' (addr 0x%lx, btf id %d, flags %s).\n",
 			    att->dry_run ? " (dry run)" : "", i + 1,
 			    NAME_MOD(finfo->name, finfo->module), func_addr, finfo->btf_id,
 			    flags_buf);
+                        free(elem);
 		} else if (att->verbose) {
 			log("Attached%s to function #%d '%s%s%s%s'.\n",
 			    att->dry_run ? " (dry run)" : "", i + 1,
@@ -1195,7 +1184,9 @@ err_out:
 
 void mass_attacher__activate(struct mass_attacher *att)
 {
-	att->skel->bss->ready = true;
+	uint32_t zero = 0;
+
+	bpf_map_update_elem(bpf_map__fd(att->skel->maps.ret_args_map), &args, &zero, 0);
 }
 
 struct SKEL_NAME *mass_attacher__skeleton(const struct mass_attacher *att)

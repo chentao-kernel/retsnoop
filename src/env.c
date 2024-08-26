@@ -32,6 +32,7 @@ struct env env = {
 	.args_max_sized_arg_size = DEFAULT_FNARGS_SIZED_ARG_SZ,
 	.args_max_str_arg_size = DEFAULT_FNARGS_STR_ARG_SZ,
 	.args_fmt_max_arg_width = DEFAULT_FNARGS_FMT_MAX_ARG_WIDTH,
+	.btf_path = {0},
 };
 
 __attribute__((constructor))
@@ -76,6 +77,8 @@ static const struct argp_option opts[] = {
 	  "Use a pre-defined set of entry/allow/deny globs for a given use case (supported cases: bpf, perf)" },
 	{ "entry", 'e', "GLOB", 0,
 	  "Glob for entry functions that trigger error stack trace collection" },
+	{ "btf", 'b', "BTF", 0,
+	  "the btf file path" },
 	{ "allow", 'a', "GLOB", 0,
 	  "Glob for allowed functions captured in error stack trace collection" },
 	{ "deny", 'd', "GLOB", 0,
@@ -407,6 +410,9 @@ static error_t parse_arg(int key, char *arg, struct argp_state *state)
 		break;
 	case OPT_CONFIG_HELP:
 		env.show_config_help = true;
+		break;
+	case 'b':
+		strcpy(env.btf_path, arg);
 		break;
 	case 'V':
 		env.show_version = true;

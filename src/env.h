@@ -130,6 +130,7 @@ struct env {
 	bool has_branch_snapshot;
 	bool has_lbr;
 	bool has_ringbuf;
+	char btf_path[256];
 };
 
 extern struct env env;

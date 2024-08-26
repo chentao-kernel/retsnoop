@@ -108,6 +108,7 @@ int func_flags(const char *func_name, const struct btf *btf, int btf_id);
 void format_func_flags(char *buf, size_t buf_sz, enum func_flags flags);
 
 int handle_event(void *ctx, void *data, size_t data_sz);
+void handle_lost_event(void *ctx, int cpu, size_t lost_cnt);
 
 long read_dropped_sessions(void);
 
